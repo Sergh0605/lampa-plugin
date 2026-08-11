@@ -1,25 +1,15 @@
 (() => {
     // --- НАСТРОЙКИ ---
-    const SERVER_URL = 'http://192.168.1.41:8192';  // <-- Меняйте здесь при необходимости
+    const SERVER_URL = 'http://192.168.1.1:8192';
     // -----------------
 
-    // Настройки плагина в меню Lampa
-    Lampa.Settings.add({
-        title: 'Медиатека',
-        group: 'Мои плагины',
-        name: 'media_provider',
-        type: 'static',
-        value: 'Моя медиатека',
-        onChange: () => {}
-    });
-
-    // Функция для запросов к HTTP-серверу
+    // Функция для запросов (используем fetch, но обёртка)
     function request(url) {
         return fetch(url).then(r => r.text());
     }
 
     // Добавляем пункт в главное меню
-    Lampa.Listener.follow('app', event => {
+    Lampa.Listener.follow('app', function(event) {
         if (event.type === 'ready') {
             Lampa.Activity.push({
                 id: 'my_media',
@@ -30,92 +20,87 @@
         }
     });
 
-    // Компонент для отображения списка файлов (с поддержкой путей)
-    Lampa.Component.add('my_media_main', function() {
-        let self = this;
-        let path = self.params.path || ''; // текущий путь (подпапка)
+    // Компонент для отображения файлов и папок
+    Lampa.Component.add('my_media_main', {
+        render: function() {
+            // Получаем текущий путь из параметров (если есть)
+            let path = this.params && this.params.path ? this.params.path : '';
+            let container = document.createElement('div');
+            container.className = 'frame';
+            let scroll = document.createElement('div');
+            scroll.className = 'scroll';
+            container.appendChild(scroll);
 
-        // Функция для получения содержимого папки
-        function loadFolder(folderPath) {
-            let url = SERVER_URL + '/' + folderPath;
-            return request(url);
-        }
-
-        // Рендер списка
-        self.render = function() {
-            let frame = $('<div class="frame"><div class="scroll"></div></div>');
-            let scroll = frame.find('.scroll');
-
-            // Показываем название текущей папки
+            // Заголовок
             let title = path ? '📂 ' + path : '📂 Корневая папка';
-            let titleEl = $('<div style="padding: 15px; font-size: 20px; font-weight: bold; color: #fff;">' + title + '</div>');
-            scroll.append(titleEl);
+            let titleEl = document.createElement('div');
+            titleEl.style.cssText = 'padding: 15px; font-size: 20px; font-weight: bold; color: #fff;';
+            titleEl.textContent = title;
+            scroll.appendChild(titleEl);
 
-            // Если мы не в корне, добавляем кнопку "Назад"
+            // Кнопка "Назад" (если не в корне)
             if (path) {
-                let backBtn = $('<div class="my-media-item" style="padding: 10px; border-bottom: 1px solid #333; cursor: pointer; color: #ffcc00;">⬅️ Назад</div>');
-                backBtn.on('click', function() {
-                    // Переходим на уровень выше
+                let backBtn = document.createElement('div');
+                backBtn.className = 'my-media-item';
+                backBtn.style.cssText = 'padding: 10px; border-bottom: 1px solid #333; cursor: pointer; color: #ffcc00;';
+                backBtn.textContent = '⬅️ Назад';
+                backBtn.addEventListener('click', function() {
                     let parentPath = path.split('/').slice(0, -1).join('/');
                     Lampa.Activity.push({
                         component: 'my_media_main',
                         params: { path: parentPath }
                     });
                 });
-                scroll.append(backBtn);
+                scroll.appendChild(backBtn);
             }
 
             // Загружаем список файлов
-            loadFolder(path)
-                .then(html => {
+            let url = SERVER_URL + '/' + (path ? path + '/' : '');
+            request(url)
+                .then(function(html) {
                     let parser = new DOMParser();
                     let doc = parser.parseFromString(html, 'text/html');
                     let links = doc.querySelectorAll('a');
 
                     let items = [];
-                    links.forEach(link => {
+                    links.forEach(function(link) {
                         let href = link.getAttribute('href');
                         let name = link.textContent.trim();
-
-                        // Пропускаем ссылку на родительскую папку (..)
                         if (href === '../') return;
-
                         let isFolder = href.endsWith('/');
-                        let isFile = !isFolder;
-
-                        items.push({ name, href, isFolder, isFile });
+                        items.push({ name, href, isFolder });
                     });
 
-                    // Сортируем: сначала папки, потом файлы
-                    items.sort((a, b) => {
+                    // Сортировка: сначала папки, потом файлы
+                    items.sort(function(a, b) {
                         if (a.isFolder && !b.isFolder) return -1;
                         if (!a.isFolder && b.isFolder) return 1;
                         return a.name.localeCompare(b.name);
                     });
 
                     if (items.length === 0) {
-                        scroll.append('<div style="padding: 20px; color: #888;">Папка пуста</div>');
+                        let empty = document.createElement('div');
+                        empty.style.cssText = 'padding: 20px; color: #888;';
+                        empty.textContent = 'Папка пуста';
+                        scroll.appendChild(empty);
                     }
 
-                    items.forEach(item => {
+                    items.forEach(function(item) {
+                        let el = document.createElement('div');
+                        el.className = 'my-media-item';
                         let icon = item.isFolder ? '📁' : '🎬';
                         let color = item.isFolder ? '#4fc3f7' : '#81c784';
-                        let el = $(`
-                            <div class="my-media-item" style="padding: 10px; border-bottom: 1px solid #333; cursor: pointer; color: ${color};">
-                                ${icon} ${item.name}
-                            </div>
-                        `);
+                        el.style.cssText = 'padding: 10px; border-bottom: 1px solid #333; cursor: pointer; color: ' + color + ';';
+                        el.textContent = icon + ' ' + item.name;
 
-                        el.on('click', () => {
+                        el.addEventListener('click', function() {
                             if (item.isFolder) {
-                                // Переходим в подпапку
                                 let newPath = path ? path + '/' + item.name : item.name;
                                 Lampa.Activity.push({
                                     component: 'my_media_main',
                                     params: { path: newPath }
                                 });
                             } else {
-                                // Воспроизводим файл
                                 let fileUrl = SERVER_URL + '/' + (path ? path + '/' + item.name : item.name);
                                 if (item.name.match(/\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v)$/i)) {
                                     Lampa.Player.play({ url: fileUrl, title: item.name });
@@ -125,18 +110,31 @@
                             }
                         });
 
-                        scroll.append(el);
+                        scroll.appendChild(el);
                     });
                 })
-                .catch(err => {
-                    scroll.html(`<div style="color: red; padding: 20px;">Ошибка загрузки: ${err}</div>`);
+                .catch(function(err) {
+                    let errorMsg = document.createElement('div');
+                    errorMsg.style.cssText = 'color: red; padding: 20px;';
+                    errorMsg.textContent = 'Ошибка загрузки: ' + err;
+                    scroll.appendChild(errorMsg);
                 });
 
-            return frame;
-        };
-
-        self.destroy = function() {
-            // очистка, если нужна
-        };
+            return container;
+        },
+        destroy: function() {
+            // Очистка при необходимости
+        }
     });
+
+    // Добавляем настройки (опционально)
+    Lampa.Settings.add({
+        title: 'Медиатека',
+        group: 'Мои плагины',
+        name: 'media_provider',
+        type: 'static',
+        value: 'Моя медиатека',
+        onChange: function() {}
+    });
+
 })();
