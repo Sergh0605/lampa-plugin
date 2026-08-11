@@ -1,140 +1,193 @@
-(() => {
+(function () {
+    'use strict';
+
     // --- НАСТРОЙКИ ---
-    const SERVER_URL = 'http://192.168.1.1:8192';
+    var SERVER_URL = 'http://192.168.1.1:8192'; // проверьте, что это реальный адрес вашего сервера
     // -----------------
 
-    // Функция для запросов (используем fetch, но обёртка)
     function request(url) {
-        return fetch(url).then(r => r.text());
+        return new Promise(function (resolve, reject) {
+            // Lampa.Reguest — обёртка над XHR, встроенная в Lampa (умеет таймауты и т.п.)
+            var net = new Lampa.Reguest();
+            net.timeout(8000);
+            net.native(url, resolve, reject, false, { dataType: 'text' });
+        });
     }
 
-    // Добавляем пункт в главное меню
-    Lampa.Listener.follow('app', function(event) {
-        if (event.type === 'ready') {
-            Lampa.Activity.push({
-                id: 'my_media',
-                title: 'Моя видеотека',
-                icon: 'folder',
-                component: 'my_media_main'
+    function parseDirListing(html) {
+        var parser = new DOMParser();
+        var doc = parser.parseFromString(html, 'text/html');
+        var links = doc.querySelectorAll('a');
+        var items = [];
+
+        links.forEach(function (link) {
+            var href = link.getAttribute('href');
+            var name = link.textContent.trim();
+            if (!href || href === '../') return;
+            var isFolder = href.endsWith('/');
+            items.push({ name: name, href: href, isFolder: isFolder });
+        });
+
+        items.sort(function (a, b) {
+            if (a.isFolder && !b.isFolder) return -1;
+            if (!a.isFolder && b.isFolder) return 1;
+            return a.name.localeCompare(b.name);
+        });
+
+        return items;
+    }
+
+    // Компонент — конструктор, как того требует Lampa
+    function MyMediaComponent(object) {
+        var scroll = new Lampa.Scroll({ mask: true, over: true });
+        var html = $('<div class="my-media"></div>');
+        var path = (object.params && object.params.path) || '';
+
+        this.create = function () {
+            return this.render();
+        };
+
+        this.render = function () {
+            return html;
+        };
+
+        this.back = function () {
+            Lampa.Activity.backward();
+        };
+
+        this.pause = function () {};
+        this.stop = function () {};
+
+        this.destroy = function () {
+            scroll.destroy();
+            html.remove();
+        };
+
+        this.start = function () {
+            var _this = this;
+
+            Lampa.Controller.add('content', {
+                toggle: function () {
+                    Lampa.Controller.collectionSet(scroll.render());
+                    Lampa.Controller.collectionFocus(false, scroll.render());
+                },
+                up: function () {
+                    if (Navigator.canmove('up')) Navigator.move('up');
+                    else Lampa.Controller.toggle('head');
+                },
+                down: function () {
+                    if (Navigator.canmove('down')) Navigator.move('down');
+                },
+                left: function () {
+                    if (Navigator.canmove('left')) Navigator.move('left');
+                    else Lampa.Controller.toggle('menu');
+                },
+                right: function () {
+                    if (Navigator.canmove('right')) Navigator.move('right');
+                },
+                back: this.back
             });
-        }
-    });
 
-    // Компонент для отображения файлов и папок
-    Lampa.Component.add('my_media_main', {
-        render: function() {
-            // Получаем текущий путь из параметров (если есть)
-            let path = this.params && this.params.path ? this.params.path : '';
-            let container = document.createElement('div');
-            container.className = 'frame';
-            let scroll = document.createElement('div');
-            scroll.className = 'scroll';
-            container.appendChild(scroll);
+            Lampa.Controller.toggle('content');
 
-            // Заголовок
-            let title = path ? '📂 ' + path : '📂 Корневая папка';
-            let titleEl = document.createElement('div');
-            titleEl.style.cssText = 'padding: 15px; font-size: 20px; font-weight: bold; color: #fff;';
-            titleEl.textContent = title;
-            scroll.appendChild(titleEl);
+            this.load(_this);
+        };
 
-            // Кнопка "Назад" (если не в корне)
+        this.load = function (_this) {
+            var title = $('<div class="my-media__title">' +
+                (path ? '📂 ' + Lampa.Utils.escapeHtml(path) : '📂 Корневая папка') +
+                '</div>');
+            html.empty().append(title);
+            scroll.render().appendChild ? null : null; // no-op safeguard
+            html.append(scroll.render());
+            scroll.clear();
+
             if (path) {
-                let backBtn = document.createElement('div');
-                backBtn.className = 'my-media-item';
-                backBtn.style.cssText = 'padding: 10px; border-bottom: 1px solid #333; cursor: pointer; color: #ffcc00;';
-                backBtn.textContent = '⬅️ Назад';
-                backBtn.addEventListener('click', function() {
-                    let parentPath = path.split('/').slice(0, -1).join('/');
+                var back = Lampa.Template.get('my_media_item', {
+                    title: '⬅️ Назад'
+                }, true);
+                back.on('hover:enter', function () {
+                    var parentPath = path.split('/').slice(0, -1).join('/');
                     Lampa.Activity.push({
+                        url: '',
+                        title: 'Моя видеотека',
                         component: 'my_media_main',
                         params: { path: parentPath }
                     });
                 });
-                scroll.appendChild(backBtn);
+                scroll.append(back);
             }
 
-            // Загружаем список файлов
-            let url = SERVER_URL + '/' + (path ? path + '/' : '');
-            request(url)
-                .then(function(html) {
-                    let parser = new DOMParser();
-                    let doc = parser.parseFromString(html, 'text/html');
-                    let links = doc.querySelectorAll('a');
+            request(SERVER_URL + '/' + (path ? path + '/' : ''))
+                .then(function (raw) {
+                    var items = parseDirListing(raw);
 
-                    let items = [];
-                    links.forEach(function(link) {
-                        let href = link.getAttribute('href');
-                        let name = link.textContent.trim();
-                        if (href === '../') return;
-                        let isFolder = href.endsWith('/');
-                        items.push({ name, href, isFolder });
-                    });
-
-                    // Сортировка: сначала папки, потом файлы
-                    items.sort(function(a, b) {
-                        if (a.isFolder && !b.isFolder) return -1;
-                        if (!a.isFolder && b.isFolder) return 1;
-                        return a.name.localeCompare(b.name);
-                    });
-
-                    if (items.length === 0) {
-                        let empty = document.createElement('div');
-                        empty.style.cssText = 'padding: 20px; color: #888;';
-                        empty.textContent = 'Папка пуста';
-                        scroll.appendChild(empty);
+                    if (!items.length) {
+                        scroll.append($('<div class="my-media__empty">Папка пуста</div>'));
                     }
 
-                    items.forEach(function(item) {
-                        let el = document.createElement('div');
-                        el.className = 'my-media-item';
-                        let icon = item.isFolder ? '📁' : '🎬';
-                        let color = item.isFolder ? '#4fc3f7' : '#81c784';
-                        el.style.cssText = 'padding: 10px; border-bottom: 1px solid #333; cursor: pointer; color: ' + color + ';';
-                        el.textContent = icon + ' ' + item.name;
+                    items.forEach(function (item) {
+                        var icon = item.isFolder ? '📁' : '🎬';
+                        var el = $('<div class="my-media__item selector">' + icon + ' ' +
+                            Lampa.Utils.escapeHtml(item.name) + '</div>');
 
-                        el.addEventListener('click', function() {
+                        el.on('hover:enter', function () {
                             if (item.isFolder) {
-                                let newPath = path ? path + '/' + item.name : item.name;
+                                var newPath = path ? path + '/' + item.name : item.name;
                                 Lampa.Activity.push({
+                                    url: '',
+                                    title: 'Моя видеотека',
                                     component: 'my_media_main',
                                     params: { path: newPath }
                                 });
+                            } else if (item.name.match(/\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v)$/i)) {
+                                var fileUrl = SERVER_URL + '/' + (path ? path + '/' + item.name : item.name);
+                                Lampa.Player.play({ url: fileUrl, title: item.name });
+                                Lampa.Player.playlist([{ url: fileUrl, title: item.name }]);
                             } else {
-                                let fileUrl = SERVER_URL + '/' + (path ? path + '/' + item.name : item.name);
-                                if (item.name.match(/\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v)$/i)) {
-                                    Lampa.Player.play({ url: fileUrl, title: item.name });
-                                } else {
-                                    alert('Это не видеофайл: ' + item.name);
-                                }
+                                Lampa.Noty.show('Это не видеофайл: ' + item.name);
                             }
                         });
 
-                        scroll.appendChild(el);
+                        scroll.append(el);
                     });
+
+                    Lampa.Controller.toggle('content');
                 })
-                .catch(function(err) {
-                    let errorMsg = document.createElement('div');
-                    errorMsg.style.cssText = 'color: red; padding: 20px;';
-                    errorMsg.textContent = 'Ошибка загрузки: ' + err;
-                    scroll.appendChild(errorMsg);
+                .catch(function (err) {
+                    scroll.append($('<div class="my-media__error">Ошибка загрузки: ' + err + '</div>'));
                 });
+        };
+    }
 
-            return container;
-        },
-        destroy: function() {
-            // Очистка при необходимости
+    // Регистрируем компонент
+    Lampa.Component.add('my_media_main', MyMediaComponent);
+
+    // Пункт в главном меню — добавляем один раз, а не на каждый 'ready'
+    var menuAdded = false;
+
+    Lampa.Listener.follow('app', function (event) {
+        if (event.type === 'ready' && !menuAdded) {
+            menuAdded = true;
+
+            var menuItem = $(
+                '<li class="menu__item selector" data-action="my_media">' +
+                '<div class="menu__ico"><svg></svg></div>' +
+                '<div class="menu__text">Моя видеотека</div>' +
+                '</li>'
+            );
+
+            menuItem.on('hover:enter', function () {
+                Lampa.Activity.push({
+                    url: '',
+                    title: 'Моя видеотека',
+                    component: 'my_media_main',
+                    page: 1
+                });
+            });
+
+            $('.menu .menu__list').eq(0).append(menuItem);
         }
-    });
-
-    // Добавляем настройки (опционально)
-    Lampa.Settings.add({
-        title: 'Медиатека',
-        group: 'Мои плагины',
-        name: 'media_provider',
-        type: 'static',
-        value: 'Моя медиатека',
-        onChange: function() {}
     });
 
 })();
