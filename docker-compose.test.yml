@@ -1,0 +1,25 @@
+services:
+  # Lampa web для ручных тестов. Фиксированный порт 9100, не менять.
+  lampa:
+    image: androschuk/lampa:latest
+    container_name: lampa-test
+    restart: unless-stopped
+    ports:
+      - "9100:80"
+
+  # Коллектор логов плагина. Фиксированный порт 9101, не менять.
+  # Браузер на другой машине в LAN шлёт сюда POST /log, агент читает файл ./logs/lampa-plugin.log.
+  log-collector:
+    image: python:3.11-alpine
+    container_name: lampa-log-collector
+    restart: unless-stopped
+    user: "1000:1000" # файлы логов остаются за serghnt, не root
+    ports:
+      - "9101:9101"
+    environment:
+      - PORT=9101
+      - LOG_FILE=/logs/lampa-plugin.log
+    volumes:
+      - ./log-collector/server.py:/app/server.py:ro
+      - ./logs:/logs
+    command: ["python", "/app/server.py"]
