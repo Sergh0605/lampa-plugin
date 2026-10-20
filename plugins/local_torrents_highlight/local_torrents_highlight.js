@@ -7,7 +7,7 @@
 
         // Маркер сборки: обновляется каждую итерацию отладки (см. AGENTS.md).
         // По нему агент отличает логи нового прогона от старых.
-        var __BUILD__ = '2026-10-19T03-10';
+        var __BUILD__ = '2026-10-20T18-50';
 
         // Локальная разработка без публикации наружу:
         // креды, секреты и адреса сервисов в коде допустимы.
@@ -220,7 +220,7 @@
                                 map[t.comment] = {
                                     hash: t.hash, state: t.state, progress: t.progress,
                                     name: t.name, dlspeed: t.dlspeed, upspeed: t.upspeed, eta: t.eta,
-                                    size: t.size, comment: t.comment || ''
+                                    size: t.size, comment: t.comment || '', magnet_uri: t.magnet_uri || ''
                                 };
                             }
                         });
@@ -647,6 +647,200 @@
             }
         }
 
+        // ---------- PLAYBACK VIA TORRSERVER ----------
+        // Enter на строке экрана qBittorrent играет торрент через TorrServer
+        // пользователя в нативном Lampa.Player (heartbeat/save loop и диалог
+        // resume ведёт само ядро, своих resume-сторов/модалок нет).
+        // qBittorrent здесь — только источник magnet'а; прямых файловых URL,
+        // nginx-маппингов и sequential-хаков нет.
+        var tsNet = new Lampa.Reguest();
+
+        var VIDEO_EXTS = ['asf', 'wmv', 'divx', 'avi', 'mp4', 'm4v', 'mov', '3gp',
+            '3g2', 'mkv', 'trp', 'tp', 'mts', 'mpg', 'mpeg', 'dat', 'vob',
+            'rm', 'rmvb', 'm2ts', 'ts'];
+
+        function tsBase() {
+            var ts = '';
+            try { ts = Lampa.Storage.field('torrserver_url') || ''; } catch (e) {}
+            if (!ts) { try { ts = Lampa.Storage.field('torrserver_url_two') || ''; } catch (e) {} }
+            return String(ts || '').replace(/\/+$/, '');
+        }
+
+        // Категория для TorrServer add: "tv" если имя похоже на сериал, иначе "movie".
+        function tsCategory(name) {
+            var n = String(name || '');
+            if (/s\d{1,2}e\d{1,2}/i.test(n) || /\b\d{1,2}x\d{1,2}\b/i.test(n)
+                || /сезон/i.test(n) || /сери[яи]/i.test(n)) return 'tv';
+            return 'movie';
+        }
+
+        function fileBase(path) {
+            return String(path || '').split('\\').pop().split('/').pop();
+        }
+
+        function fileExt(path) {
+            var b = fileBase(path);
+            var i = b.lastIndexOf('.');
+            return i === -1 ? '' : b.slice(i + 1).toLowerCase();
+        }
+
+        function fileLen(f) {
+            return Number(f.length !== undefined ? f.length : f.size) || 0;
+        }
+
+        function fileIdx(f, pos) {
+            if (f.id !== undefined && f.id !== null) return f.id;
+            if (f.index !== undefined && f.index !== null) return f.index;
+            return pos;
+        }
+
+        // Magnet из qB info, фолбэк — DHT-магнит по infohash.
+        function getMagnet(rec) {
+            var m = rec && rec.magnet_uri ? String(rec.magnet_uri).replace(/^\s+|\s+$/g, '') : '';
+            if (m) return m;
+            var h = rec && rec.hash ? String(rec.hash).toLowerCase() : '';
+            if (/^[0-9a-f]{40}$/.test(h)) return 'magnet:?xt=urn:btih:' + h;
+            return '';
+        }
+
+        function streamUrl(path, hash, fileId) {
+            var ts = tsBase();
+            var gts = false;
+            try { gts = !!Lampa.Storage.field('torrserver_gts'); } catch (e) {}
+            if (gts) return ts + '/gst/' + encodeURIComponent(hash) + '/master.m3u8?index=' + fileId + '&audio=0';
+            return ts + '/stream/' + encodeURIComponent(fileBase(path)) + '?link=' + hash + '&index=' + fileId + '&play';
+        }
+
+        // Payload дословно как у ядра: Torserver.add({poster,title,link,data:{lampa:true,movie}}).
+        function tsAdd(magnet, title, ok, fail) {
+            var ts = tsBase();
+            var body = JSON.stringify({
+                action: 'add',
+                link: magnet,
+                title: '[LAMPA] ' + String(title || '').replace('??', '?'),
+                poster: '',
+                data: JSON.stringify({ lampa: true }),
+                save_to_db: true,
+                category: tsCategory(title)
+            });
+            tsNet.silent(ts + '/torrents', ok, fail, body, { timeout: 15000, dataType: 'json' });
+        }
+
+        // file_stats[] поллингом: раз в 2с, до ~10 попыток, пока список непуст.
+        function tsFiles(hash, ok, fail) {
+            var ts = tsBase();
+            var body = JSON.stringify({ action: 'get', hash: hash });
+            var net = new Lampa.Reguest();
+            var tries = 0;
+            (function ask() {
+                tries++;
+                net.silent(ts + '/torrents', function(resp) {
+                    var list = resp && resp.file_stats ? resp.file_stats : [];
+                    if (list.length) { ok(list); return; }
+                    if (tries < 10) setTimeout(ask, 2000);
+                    else fail('empty');
+                }, function() {
+                    if (tries < 10) setTimeout(ask, 2000);
+                    else fail('error');
+                }, body, { timeout: 15000, dataType: 'json' });
+            })();
+        }
+
+        function playTorrentFile(file, pos, rec) {
+            var path = file.path || file.name || '';
+            var hash = String(rec.hash || '').toLowerCase();
+            var fid = fileIdx(file, pos);
+            var url = streamUrl(path, hash, fid);
+            var title = fileBase(path) || rec.name || '';
+            var fileHash = '';
+            try { fileHash = Lampa.Utils.hash(path); } catch (e) {}
+            var timeline = null;
+            try { timeline = Lampa.Timeline.view(fileHash); } catch (e) {}
+            log('info', 'play start', 'hash=' + hash.slice(0, 12) + ' index=' + fid + ' file=' + String(title).slice(0, 80));
+            try {
+                Lampa.Player.play({ url: url, title: title, torrent_hash: hash, timeline: timeline });
+            } catch (e) {
+                log('error', 'player fail', String(e && e.message || e).slice(0, 200));
+                try { Lampa.Noty.show('Не удалось запустить плеер', { style: 'error' }); } catch (e2) {}
+            }
+        }
+
+        function resolveFile(files, rec, item) {
+            var videos = (files || []).map(function(f, i) { return { f: f, i: i }; }).filter(function(w) {
+                return VIDEO_EXTS.indexOf(fileExt(w.f.path || w.f.name || '')) !== -1;
+            });
+            if (!videos.length) {
+                log('error', 'no video files', 'hash=' + String(rec.hash || '').slice(0, 12) + ' count=' + (files || []).length);
+                try { Lampa.Noty.show('В торренте нет видеофайлов', { style: 'error' }); } catch (e) {}
+                return;
+            }
+            if (videos.length === 1) {
+                playTorrentFile(videos[0].f, videos[0].i, rec);
+                return;
+            }
+            videos.sort(function(a, b) { return fileLen(b.f) - fileLen(a.f); });
+            var items = videos.map(function(w) {
+                return { title: fileBase(w.f.path || w.f.name || '') + ' · ' + formatSize(fileLen(w.f)), file: w.f, pos: w.i };
+            });
+            var back = prevControllerName();
+            try {
+                Lampa.Select.show({
+                    title: String(rec.name || '').slice(0, 60),
+                    items: items,
+                    selected: 0,
+                    onBack: function() {
+                        if (back) { try { Lampa.Controller.toggle(back); } catch (e) {} }
+                        qbRefocus(item);
+                    },
+                    onSelect: function(sel) {
+                        try { Lampa.Select.close(); } catch (e) {}
+                        if (sel && sel.file) playTorrentFile(sel.file, sel.pos, rec);
+                        else qbRefocus(item);
+                    }
+                });
+            } catch (e) {
+                log('error', 'select fail', String(e && e.message || e).slice(0, 200));
+                playTorrentFile(videos[0].f, videos[0].i, rec);
+            }
+        }
+
+        // Enter-цепочка: getMagnet -> tsAdd -> poll tsFiles -> resolveFile -> Player.play.
+        // В логах/ошибках — без секретов: только ts base, hash-префикс, count.
+        function playTorrentRec(rec, item) {
+            if (!rec || !rec.hash) {
+                try { Lampa.Noty.show('Нет infohash для воспроизведения', { style: 'error' }); } catch (e) {}
+                return;
+            }
+            var ts = tsBase();
+            if (!ts) {
+                log('error', 'ts missing', 'torrserver_url not set');
+                try { Lampa.Noty.show('TorrServer не настроен (torrserver_url)', { style: 'error' }); } catch (e) {}
+                return;
+            }
+            var magnet = getMagnet(rec);
+            if (!magnet) {
+                log('error', 'no magnet', 'hash=' + String(rec.hash).slice(0, 12));
+                try { Lampa.Noty.show('Нет magnet-ссылки для воспроизведения', { style: 'error' }); } catch (e) {}
+                return;
+            }
+            var hash = String(rec.hash).toLowerCase();
+            var title = rec.name || hash;
+            log('info', 'ts add start', 'hash=' + hash.slice(0, 12));
+            tsAdd(magnet, title, function() {
+                log('info', 'ts add ok', 'hash=' + hash.slice(0, 12));
+                tsFiles(hash, function(list) {
+                    log('info', 'ts files ok', 'hash=' + hash.slice(0, 12) + ' count=' + list.length);
+                    resolveFile(list, rec, item);
+                }, function(why) {
+                    log('error', 'ts files fail', 'hash=' + hash.slice(0, 12) + ' why=' + why);
+                    try { Lampa.Noty.show('TorrServer: не удалось получить файлы (' + why + ')', { style: 'error' }); } catch (e) {}
+                });
+            }, function() {
+                log('error', 'ts add fail', 'ts=' + ts + ' hash=' + hash.slice(0, 12));
+                try { Lampa.Noty.show('TorrServer недоступен или не добавил торрент', { style: 'error' }); } catch (e) {}
+            });
+        }
+
         function init() {
             Lampa.Lang.add({
                 local_torrents_highlight_settings: { ru: 'Подсветка локальных торрентов', en: 'Local torrents highlight' },
@@ -914,6 +1108,13 @@
                         } catch (e) {}
                     });
                 row.on('hover:enter', function() {
+                    // Enter — воспроизведение через TorrServer (цепочка playTorrentRec).
+                    // Управление (стоп/старт/удалить) — через долгое нажатие hover:long.
+                    var live = torrentMap[comment] || rec;
+                    if (live) playTorrentRec(live, row);
+                    else openTorrentMenu({ Guid: comment, Title: rec.name }, row);
+                });
+                row.on('hover:long', function() {
                     openTorrentMenu({ Guid: comment, Title: rec.name }, row);
                 });
                 renderBadge(row, rec);

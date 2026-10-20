@@ -20,6 +20,7 @@ if(!window.my_plugin_ready) startMyPlugin();
 - Сеть — только `Lampa.Reguest`, хранение — только `Lampa.Storage`, CSS — инжект через `Lampa.Template`. `fetch/localStorage` не использовать.
 - `SettingsApi`: для `type:'input'` обязательно `values:''` (пустая строка). Без него рендер настроек падает `Cannot read properties of undefined (reading '<значение>')`: Lampa делает `d$a[name]=values`, а показ ищет `d$a[name][value]`.
 - Секреты: проект локальный, без публикации наружу. Креды, секреты и адреса сервисов в коде допустимы (дефолты в `DEFAULTS` + `SettingsApi`). Уборку секретов делать только отдельной задачей, не по умолчанию.
+- Воспроизведение — только через TorrServer пользователя (`Player.play` + `Timeline.view`), никаких прямых файловых URL / nginx-маппингов / своих resume-сторов.
 
 ## Ручной тест (единственный способ, только вручную)
 
