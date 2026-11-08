@@ -7,7 +7,7 @@
 
         // Маркер сборки: обновляется каждую итерацию отладки (см. AGENTS.md).
         // По нему агент отличает логи нового прогона от старых.
-        var __BUILD__ = '2026-10-20T18-50';
+        var __BUILD__ = '2026-10-21T05-10';
 
         // Локальная разработка без публикации наружу:
         // креды, секреты и адреса сервисов в коде допустимы.
@@ -47,6 +47,31 @@
         var fetchOkOnce = false;
         var visibleItems = [];
         var pollTimer = 0;
+
+        // Состояние экрана qBittorrent — в скоупе плагина (не init),
+        // чтобы qbRefocus/confirmDelete видели те же qbActive/qbScroll,
+        // что и QbittorrentScreen/qbRefresh (иначе ReferenceError в try/catch
+        // и молчаливый no-op возврата фокуса).
+        var qbScroll = null;
+        var qbHtml = null;
+        var qbStruct = null;
+        var qbFocusedHash = '';
+        var qbActive = false;
+        var qbMenuAdded = false;
+
+        // Чужак 'content': Controller.add(name,calls) только пишет controlls[name]=calls,
+        // get/list в API нет — прочитать прошлую дефиницию нельзя. Поэтому обёртка
+        // вокруг add в init() подглядывает чужие дефиниции 'content' в момент записи
+        // (своя помечена __lth_qb и не сохраняется). Используется для делегирования
+        // toggle/back при !qbActive и восстановления в stop()/destroy().
+        var lastForeignContentDef = null;
+        var contentAddWrapped = false;
+
+        // Контроллер до чужого Select A: Select одиночный, наш show(B)
+        // уничтожает A без восстановления. Запоминаем в обёртке show в init():
+        // если Select не открыт — пишем enabled().name (кроме пустого/'select').
+        var lastPreSelect = 'content';
+        var selectShowWrapped = false;
 
         function isEnabled() {
             return Lampa.Storage.field('local_torrents_highlight_enabled') !== false;
@@ -488,14 +513,29 @@
             return { magnet: '', src: 'none' };
         }
 
-        // Возврат фокуса на строку нашего экрана после закрытия меню/диалога.
-        // Без этого после Back фокус висит в пустоте и стрелки «молчат».
-        function qbRefocus(item) {
+        // Контекст меню: qb-экран (строка .lth-row при живом qbActive/qbScroll)
+        // vs вложенность в чужой Select (список торрентов фильма, обычный
+        // .torrent-item без lth-row). Различаем строго по строке —
+        // back/enabled в этот момент уже протухли (active залип на нашем B).
+        function isQbCtx(item) {
             try {
-                if (!item || !item.length || !item.hasClass || !item.hasClass('lth-row') || !qbScroll) return;
-                if (!$.contains(document, item[0])) return; // строку уже перестроили — фокусом займётся ребилд
-                Lampa.Controller.toggle('content');
-                Lampa.Controller.collectionFocus(item[0], qbScroll.render());
+                return !!(qbActive && qbScroll && item && item.length && item.hasClass
+                    && item.hasClass('lth-row') && $.contains(document, item[0]));
+            } catch (e) { return false; }
+        }
+
+        // Возврат фокуса после закрытия меню/диалога.
+        // qb-контекст (строка .lth-row): toggle('content') + collectionFocus на строку.
+        // film-контекст (чужой Select A уничтожен нашим show): toggle(back),
+        // где back — контроллер до A (lastPreSelect при enabled='select').
+        function qbRefocus(back, item) {
+            try {
+                if (isQbCtx(item)) {
+                    Lampa.Controller.toggle('content');
+                    Lampa.Controller.collectionFocus(item[0], qbScroll.render());
+                } else if (back) {
+                    Lampa.Controller.toggle(back);
+                }
             } catch (e) {}
         }
 
@@ -503,11 +543,23 @@
             var guid = element.Guid;
             var name = element.Title || element.title || shortGuid(guid);
             var rec = torrentMap[guid];
-            var back = prevControllerName();
+            // back снимаем ДО show. Select одиночный: наш show(B) уничтожает
+            // чужой A без восстановления — возврат всегда на контроллер до A.
+            // Дефолт 'content', если enabled-контроллер не определился.
+            var back = prevControllerName() || 'content';
+            if (back === 'select') back = lastPreSelect || 'content';
+            var nestedBefore = false;
+            try { nestedBefore = !!(Lampa.Select && Lampa.Select.opened && Lampa.Select.opened()); } catch (e) {}
+            log('info', 'menu open', 'back=' + back + ' selback=' + lastPreSelect + ' enabled=' + prevControllerName() + ' opened=' + (nestedBefore ? 1 : 0));
 
             function onBack() {
-                if (back) { try { Lampa.Controller.toggle(back); } catch (e) {} }
-                qbRefocus(item);
+                // Канон: hide при Back делает сама Lampa, мы только toggle(back).
+                // qbRefocus внутри: qb — toggle('content') + фокус на строку,
+                // film — toggle(back) на контроллер до уничтоженного A.
+                qbRefocus(back, item);
+                var openedAfter = false;
+                try { openedAfter = !!(Lampa.Select && Lampa.Select.opened && Lampa.Select.opened()); } catch (e) {}
+                log('info', 'menu back', 'enabled=' + prevControllerName() + ' opened=' + (openedAfter ? 1 : 0));
             }
 
             if (!rec) {
@@ -528,12 +580,16 @@
                         items: items,
                         onBack: onBack,
                         onSelect: function(sel) {
-                            try { Lampa.Select.close(); } catch (e) {}
-                            if (!sel || !sel.act) return;
-                            if (sel.act === 'add' && sel.cat) {
+                            // Канон: hide при выборе делает сама Lampa,
+                            // close() не вызываем (двоил бы onBack). Только toggle(back).
+                            qbRefocus(back, item);
+                            if (sel && sel.act === 'add' && sel.cat) {
                                 log('info', 'add via', src.src + ' cat=' + sel.cat);
                                 addTorrent(src.magnet, sel.cat, String(name).slice(0, 80), guid);
                             }
+                            var openedAfter = false;
+                            try { openedAfter = !!(Lampa.Select && Lampa.Select.opened && Lampa.Select.opened()); } catch (e) {}
+                            log('info', 'menu select', 'enabled=' + prevControllerName() + ' opened=' + (openedAfter ? 1 : 0));
                         }
                     });
                 } catch (e) {
@@ -556,8 +612,17 @@
                     items: menu,
                     onBack: onBack,
                     onSelect: function(sel) {
-                        try { Lampa.Select.close(); } catch (e) {}
-                        if (!sel || !sel.act) return;
+                        // Канон: только toggle(back) через qbRefocus, без close().
+                        qbRefocus(back, item);
+                        function logSelDone() {
+                            var openedAfter = false;
+                            try { openedAfter = !!(Lampa.Select && Lampa.Select.opened && Lampa.Select.opened()); } catch (e) {}
+                            log('info', 'menu select', 'enabled=' + prevControllerName() + ' opened=' + (openedAfter ? 1 : 0));
+                        }
+                        if (!sel || !sel.act) {
+                            logSelDone();
+                            return;
+                        }
                         if (sel.act === 'toggle') {
                             var toStop = (kind === 'dl' || kind === 'up');
                             // Оптимистично красим сразу, подтверждение приедет опросом;
@@ -583,11 +648,15 @@
                             };
                             if (toStop) apiPost('/torrents/stop', { hashes: rec.hash }, 'Остановлен', afterToggle);
                             else apiPost('/torrents/start', { hashes: rec.hash }, 'Запущен', afterToggle);
+                            logSelDone();
                         } else if (sel.act === 'refresh') {
                             refreshData();
                             try { Lampa.Noty.show('Статус обновлён'); } catch (e) {}
+                            logSelDone();
                         } else if (sel.act === 'delete') {
-                            confirmDelete(rec, guid, item);
+                            // B уже скрыт авто-hide Lampa — сразу Modal.
+                            logSelDone();
+                            confirmDelete(rec, guid, item, back);
                         }
                     }
                 });
@@ -608,16 +677,35 @@
             });
         }
 
-        function confirmDelete(rec, guid, item) {
+        function confirmDelete(rec, guid, item, backParam) {
             var label = String(rec.name || rec.hash).slice(0, 80);
+            var back = backParam || 'content';
+            // Контекст фиксируем на входе: к моменту кликов по кнопкам Modal
+            // строка уже может быть перестроена/удалена и isQbCtx протухнет.
+            var qb = isQbCtx(item);
+            // B уже скрыт авто-hide Lampa, A в film уничтожено нашим show —
+            // возврат на контроллер до A: Modal.close() + toggle(back).
+            // qb: штатный возврат на строку экрана.
+            function modalBack() {
+                try { Lampa.Modal.close(); } catch (e) {}
+                // back уже пересчитан по единому правилу; страховка: 'select'
+                // сюда попасть не должен — тот же remap, что в openTorrentMenu.
+                var b = back;
+                if (b === 'select') b = lastPreSelect || 'content';
+                if (qb) qbRefocus(b, item);
+                else { try { Lampa.Controller.toggle(b); } catch (e) {} }
+            }
             try {
                 Lampa.Modal.open({
                     title: 'Удалить с файлами?',
                     html: $('<div style="padding:1em">' + esc(label) + '<br><br>Торрент и все файлы будут удалены с диска.</div>'),
+                    // Modal при Back сам НЕ закрывается — только вызывает onBack,
+                    // поэтому закрываем вручную и возвращаем фокус.
+                    onBack: modalBack,
                     buttons: [
-                        { name: 'Отмена', onSelect: function() { try { Lampa.Modal.close(); } catch (e) {} qbRefocus(item); } },
+                        { name: 'Отмена', onSelect: modalBack },
                         { name: 'Да, удалить', onSelect: function() {
-                            try { Lampa.Modal.close(); } catch (e) {}
+                            modalBack();
                             var backup = torrentMap[guid];
                             try { delete torrentMap[guid]; renderBadge(item, null); updateVisibleBadges(); } catch (e) {}
                             apiPost('/torrents/delete', { hashes: rec.hash, deleteFiles: 'true' }, 'Удалён с файлами', function(ok) {
@@ -625,15 +713,18 @@
                                     torrentMap[guid] = backup;
                                     try { renderBadge(item, backup); updateVisibleBadges(); } catch (e) {}
                                     log('info', 'delete revert', shortGuid(guid));
-                                    qbRefocus(item);
+                                    qbRefocus(back, item);
                                 } else if (ok) {
                                     refreshData(function() {
                                         try {
-                                            if (!qbActive || !qbHtml || !qbScroll) return;
-                                            var first = qbHtml.find('.lth-row.selector').first();
-                                            if (first.length) {
-                                                Lampa.Controller.toggle('content');
-                                                Lampa.Controller.collectionFocus(first[0], qbScroll.render());
+                                            if (qbActive && qbHtml && qbScroll) {
+                                                var first = qbHtml.find('.lth-row.selector').first();
+                                                if (first.length) {
+                                                    Lampa.Controller.toggle('content');
+                                                    Lampa.Controller.collectionFocus(first[0], qbScroll.render());
+                                                }
+                                            } else if (back) {
+                                                Lampa.Controller.toggle(back);
                                             }
                                         } catch (e) {}
                                     });
@@ -765,7 +856,7 @@
             }
         }
 
-        function resolveFile(files, rec, item) {
+        function resolveFile(files, rec, item, backParam) {
             var videos = (files || []).map(function(f, i) { return { f: f, i: i }; }).filter(function(w) {
                 return VIDEO_EXTS.indexOf(fileExt(w.f.path || w.f.name || '')) !== -1;
             });
@@ -782,20 +873,25 @@
             var items = videos.map(function(w) {
                 return { title: fileBase(w.f.path || w.f.name || '') + ' · ' + formatSize(fileLen(w.f)), file: w.f, pos: w.i };
             });
-            var back = prevControllerName();
+            // back уже снят синхронно при Enter (передан из playTorrentRec):
+            // в async-колбэке tsFiles enabled-контроллер уже протух.
+            // A уничтожается нашим show — то же правило, что в openTorrentMenu.
+            var back = backParam || prevControllerName() || 'content';
+            if (back === 'select') back = lastPreSelect || 'content';
             try {
                 Lampa.Select.show({
                     title: String(rec.name || '').slice(0, 60),
                     items: items,
                     selected: 0,
                     onBack: function() {
-                        if (back) { try { Lampa.Controller.toggle(back); } catch (e) {} }
-                        qbRefocus(item);
+                        // Канон: только toggle(back) через qbRefocus, без close().
+                        qbRefocus(back, item);
                     },
                     onSelect: function(sel) {
-                        try { Lampa.Select.close(); } catch (e) {}
+                        // play уводит в другую активность: сначала toggle(back),
+                        // затем play (плеер сам захватит контроллер).
+                        qbRefocus(back, item);
                         if (sel && sel.file) playTorrentFile(sel.file, sel.pos, rec);
-                        else qbRefocus(item);
                     }
                 });
             } catch (e) {
@@ -807,6 +903,9 @@
         // Enter-цепочка: getMagnet -> tsAdd -> poll tsFiles -> resolveFile -> Player.play.
         // В логах/ошибках — без секретов: только ts base, hash-префикс, count.
         function playTorrentRec(rec, item) {
+            // back снимаем СИНХРОННО при Enter: к моменту async-ответов
+            // tsAdd/tsFiles enabled-контроллер уже протухнет в замыкании.
+            var enterBack = prevControllerName() || 'content';
             if (!rec || !rec.hash) {
                 try { Lampa.Noty.show('Нет infohash для воспроизведения', { style: 'error' }); } catch (e) {}
                 return;
@@ -830,7 +929,7 @@
                 log('info', 'ts add ok', 'hash=' + hash.slice(0, 12));
                 tsFiles(hash, function(list) {
                     log('info', 'ts files ok', 'hash=' + hash.slice(0, 12) + ' count=' + list.length);
-                    resolveFile(list, rec, item);
+                    resolveFile(list, rec, item, enterBack);
                 }, function(why) {
                     log('error', 'ts files fail', 'hash=' + hash.slice(0, 12) + ' why=' + why);
                     try { Lampa.Noty.show('TorrServer: не удалось получить файлы (' + why + ')', { style: 'error' }); } catch (e) {}
@@ -972,12 +1071,13 @@
             } catch (e) {}
 
             // ---------- ЭКРАН QBittorrent: все локальные торренты ----------
-            var qbScroll = null;
-            var qbHtml = null;
-            var qbStruct = null;
-            var qbFocusedHash = '';
-            var qbActive = false;
-            var qbMenuAdded = false;
+            // Состояние (qbScroll/qbHtml/qbStruct/qbFocusedHash/qbActive/qbMenuAdded)
+            // объявлено в скоупе плагина — здесь только сброс к начальному.
+            qbScroll = null;
+            qbHtml = null;
+            qbStruct = null;
+            qbFocusedHash = '';
+            qbActive = false;
 
             function QbittorrentScreen() {
                 var scroll = new Lampa.Scroll({ mask: true, over: true });
@@ -990,9 +1090,16 @@
                 this.render = function() { return html; };
                 this.back = function() { Lampa.Activity.backward(); };
                 this.pause = function() {};
-                    this.stop = function() { qbActive = false; };
+                    this.stop = function() {
+                        qbActive = false;
+                        // Возвращаем чужую дефиницию 'content', затёртую в start():
+                        // иначе toggle('content') после ухода с экрана попадает в наш
+                        // гард и глохнет (мёртвый Back в списке торрентов фильма).
+                        try { if (lastForeignContentDef) Lampa.Controller.add('content', lastForeignContentDef); } catch (e) {}
+                    };
                     this.destroy = function() {
                         qbActive = false;
+                        try { if (lastForeignContentDef) Lampa.Controller.add('content', lastForeignContentDef); } catch (e) {}
                         qbScroll = null;
                         qbHtml = null;
                         qbStruct = null;
@@ -1013,9 +1120,18 @@
                     // Контроллер экрана — штатный 'content' (как в myprovider):
                     // тогда нативный down из шапки (toggle('content')) возвращается к нам.
                     // toggle всегда ставит фокус в список (запомненная строка или первая).
-                    Lampa.Controller.add('content', {
+                    // ВАЖНО: add('content',...) ПЕРЕЗАПИСЫВАЕТ глобальный 'content' навсегда
+                    // (get/list в API нет). Чужая дефиниция — в lastForeignContentDef
+                    // (обёртка add в init()). Пока экран закрыт (!qbActive) toggle/back
+                    // делегируют ей вместо молчаливого return — иначе список торрентов
+                    // фильма после первого визита сюда получает мёртвый toggle.
+                    var contentDef = {
+                        __lth_qb: true,
                         toggle: function() {
-                            if (!qbActive) return;
+                            if (!qbActive) {
+                                try { if (lastForeignContentDef && lastForeignContentDef.toggle) lastForeignContentDef.toggle(); } catch (e) {}
+                                return;
+                            }
                             try {
                                 Lampa.Controller.collectionSet(scroll.render());
                                 var sc = scroll.render();
@@ -1055,8 +1171,16 @@
                         right: function() {
                             if (Navigator.canmove('right')) Navigator.move('right');
                         },
-                        back: this.back
-                    });
+                        back: function() {
+                            if (!qbActive) {
+                                try {
+                                    if (lastForeignContentDef && lastForeignContentDef.back) { lastForeignContentDef.back(); return; }
+                                } catch (e) {}
+                            }
+                            try { Lampa.Activity.backward(); } catch (e) {}
+                        }
+                    };
+                    Lampa.Controller.add('content', contentDef);
                     Lampa.Controller.toggle('content');
                     qbActive = true;
                     log('info', 'screen open', 'count=' + Object.keys(torrentMap).length + ' loaded=' + urlsLoaded + ' fetching=' + isFetching);
@@ -1150,6 +1274,20 @@
                 } catch (e) {}
                 var keys = Object.keys(torrentMap);
                 var struct = keys.map(function(c) { return torrentMap[c].hash; }).join(',');
+                // Пока открыто меню/диалог — только in-place статусы, БЕЗ
+                // remove/append + collectionSet/collectionFocus: ребилд протухает
+                // item в замыканиях меню и уводит фокус из Select/Modal.
+                // qbStruct не трогаем: следующий qbRefresh после закрытия сам
+                // перестроит, если набор успел измениться.
+                if (modalOpen) {
+                    try {
+                        qbHtml.find('.lth-row').each(function() {
+                            var g = $(this).data('guid');
+                            if (g) renderBadge($(this), torrentMap[g]);
+                        });
+                    } catch (e) {}
+                    return;
+                }
                 try {
                     // Перестраиваем при смене набора ИЛИ при рассинхроне DOM и данных
                     // (карта есть, а строк на экране нет — иначе пустота висит вечно).
@@ -1208,6 +1346,48 @@
             }
 
             Lampa.Component.add('lth_qbittorrent', QbittorrentScreen);
+
+            // Обёртка Controller.add: чтения реестра в API нет (add/toggle/enabled
+            // только; см. src/core/controller.js: controlls закрыт в замыкании),
+            // поэтому чужие дефиниции 'content' подглядываем в момент записи.
+            // Своя помечена __lth_qb и пропускается. Один раз за жизнь страницы.
+            try {
+                if (!contentAddWrapped && Lampa.Controller && Lampa.Controller.add) {
+                    contentAddWrapped = true;
+                    var origAdd = Lampa.Controller.add.bind(Lampa.Controller);
+                    Lampa.Controller.add = function(name, def) {
+                        try {
+                            if (name === 'content' && def && !def.__lth_qb) lastForeignContentDef = def;
+                        } catch (e) {}
+                        return origAdd(name, def);
+                    };
+                    log('info', 'content hook', 'installed');
+                }
+            } catch (e) {}
+
+            // Пассивная обёртка Select.show (по образцу content-хука выше):
+            // запоминает контроллер ДО нашего show(B) — в этот момент чужой A
+            // ещё жив и enabled() вернёт контроллер до A. Если Select уже открыт
+            // (мы внутри B) — не трогаем: lastPreSelect относится к моменту до A.
+            // Сквозной вызов оригинала обязателен. Один раз за жизнь страницы.
+            try {
+                if (!selectShowWrapped && Lampa.Select && Lampa.Select.show) {
+                    selectShowWrapped = true;
+                    var origShow = Lampa.Select.show.bind(Lampa.Select);
+                    Lampa.Select.show = function() {
+                        try {
+                            var opened = !!(Lampa.Select && Lampa.Select.opened && Lampa.Select.opened());
+                            if (!opened) {
+                                var cur = '';
+                                try { var c = Lampa.Controller.enabled(); if (c && c.name) cur = c.name; } catch (e) {}
+                                if (cur && cur !== 'select') lastPreSelect = cur;
+                            }
+                        } catch (e) {}
+                        return origShow.apply(Lampa.Select, arguments);
+                    };
+                    log('info', 'select hook', 'installed');
+                }
+            } catch (e) {}
 
             // Пункт в главном меню (только в init, один раз)
             if (!qbMenuAdded) {
