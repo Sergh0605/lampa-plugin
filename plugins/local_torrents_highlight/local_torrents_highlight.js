@@ -7,7 +7,7 @@
 
         // Маркер сборки: обновляется каждую итерацию отладки (см. AGENTS.md).
         // По нему агент отличает логи нового прогона от старых.
-        var __BUILD__ = '2026-10-21T05-10';
+        var __BUILD__ = '2026-11-26T18-48';
 
         // Локальная разработка без публикации наружу:
         // креды, секреты и адреса сервисов в коде допустимы.
@@ -752,9 +752,51 @@
 
         function tsBase() {
             var ts = '';
-            try { ts = Lampa.Storage.field('torrserver_url') || ''; } catch (e) {}
+            var useLink = '';
+            try { useLink = Lampa.Storage.field('torrserver_use_link') || ''; } catch (e) {}
+            if (useLink === 'two') {
+                try { ts = Lampa.Storage.field('torrserver_url_two') || ''; } catch (e) {}
+            }
+            if (!ts) { try { ts = Lampa.Storage.field('torrserver_url') || ''; } catch (e) {} }
             if (!ts) { try { ts = Lampa.Storage.field('torrserver_url_two') || ''; } catch (e) {} }
-            return String(ts || '').replace(/\/+$/, '');
+            ts = String(ts || '').replace(/\/+$/, '');
+            if (!ts) return '';
+            try {
+                if (Lampa.Utils && Lampa.Utils.checkEmptyUrl) return Lampa.Utils.checkEmptyUrl(ts);
+            } catch (e) {}
+            if (!/^https?:\/\//i.test(ts)) {
+                ts = (window.location.protocol === 'https:' ? 'https://' : 'http://') + ts;
+            }
+            return ts;
+        }
+
+        function tsRequestError(ts, xhr, statusText) {
+            var status = 'unknown';
+            var text = statusText || '';
+            var selected = '';
+            var useLink = '';
+            var auth = false;
+            try {
+                if (xhr && xhr.status !== undefined) status = xhr.status;
+                if (!text && xhr && xhr.statusText) text = xhr.statusText;
+                useLink = Lampa.Storage.field('torrserver_use_link') || '';
+                selected = Lampa.Storage.field(useLink === 'two' ? 'torrserver_url_two' : 'torrserver_url') || '';
+                auth = !!Lampa.Storage.field('torrserver_auth');
+            } catch (e) {}
+            selected = String(selected || '').replace(/\/+$/, '');
+            if (selected) {
+                try {
+                    if (Lampa.Utils && Lampa.Utils.checkEmptyUrl) selected = Lampa.Utils.checkEmptyUrl(selected);
+                } catch (e) {}
+                if (!/^https?:\/\//i.test(selected)) {
+                    selected = (window.location.protocol === 'https:' ? 'https://' : 'http://') + selected;
+                }
+            }
+            text = String(text || 'none').replace(/[\r\n\t]/g, ' ').slice(0, 50);
+            return 'status=' + status + ' statusText=' + text
+                + ' auth=' + (auth ? 'on' : 'off')
+                + ' useLink=' + (useLink || 'default')
+                + ' selectedMatch=' + (selected && ts.indexOf(selected) === 0 ? 'yes' : 'no');
         }
 
         // Категория для TorrServer add: "tv" если имя похоже на сериал, иначе "movie".
@@ -934,8 +976,9 @@
                     log('error', 'ts files fail', 'hash=' + hash.slice(0, 12) + ' why=' + why);
                     try { Lampa.Noty.show('TorrServer: не удалось получить файлы (' + why + ')', { style: 'error' }); } catch (e) {}
                 });
-            }, function() {
-                log('error', 'ts add fail', 'ts=' + ts + ' hash=' + hash.slice(0, 12));
+            }, function(xhr, statusText) {
+                log('error', 'ts add fail', tsRequestError(ts, xhr, statusText)
+                    + ' ts=' + ts + ' hash=' + hash.slice(0, 12));
                 try { Lampa.Noty.show('TorrServer недоступен или не добавил торрент', { style: 'error' }); } catch (e) {}
             });
         }
